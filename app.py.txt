@@ -1,0 +1,467 @@
+import streamlit as st
+import google.generativeai as genai
+from PIL import Image
+import tempfile
+import io
+import os
+import pandas as pd
+from docx import Document
+import random
+import re
+
+# =========================================================
+# 1) CẤU HÌNH TRANG
+# =========================================================
+st.set_page_config(
+    page_title="Trợ lý đánh giá thường xuyên hằng tháng (TT27)",
+    page_icon="📝",
+    layout="centered"
+)
+
+# =========================================================
+# 2) CSS GIAO DIỆN
+# =========================================================
+st.markdown("""
+<style>
+    [data-testid="stAppViewContainer"] { background-color: #f4f6f9; }
+    .header-box {
+        background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%);
+        padding: 26px; border-radius: 16px; text-align: center; color: white;
+        margin-bottom: 18px; box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+    }
+    .header-box h1 { color: white !important; margin: 0; font-size: 1.65rem; }
+    .header-box p { margin: 6px 0 0 0; opacity: .95; }
+
+    div.stButton > button {
+        background: linear-gradient(90deg, #06b6d4, #3b82f6);
+        color: white !important; border: none; padding: 14px;
+        font-weight: 700; border-radius: 12px; width: 100%;
+        font-size: 17px;
+    }
+    .note {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        padding: 12px 14px;
+        border-radius: 12px;
+        margin: 10px 0;
+        color: #111827;
+    }
+    .muted { color: #6b7280; }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# 3) HÀM TIỆN ÍCH
+# =========================================================
+FORBIDDEN_WORDS = [" em ", " con ", " bạn ", " học sinh ", "hs ", " cháu ", " bé "]
+
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+def clean_comment_format(text: str) -> str:
+    """Chuẩn hóa: bỏ ký tự đầu dòng, chỉ viết hoa chữ cái đầu câu."""
+    if not text:
+        return ""
+    t = str(text).strip().strip("-*•").strip()
+    t = normalize_spaces(t)
+    if not t:
+        return ""
+    return t[0].upper() + t[1:]
+
+def contains_forbidden_words(text: str) -> bool:
+    t = " " + normalize_spaces(text).lower() + " "
+    for w in FORBIDDEN_WORDS:
+        if w in t:
+            return True
+    return False
+
+def classify_monthly_level(value) -> str:
+    """
+    Phân loại cho ĐÁNH GIÁ THƯỜNG XUYÊN:
+    - Hoàn thành tốt
+    - Hoàn thành
+    - Cần cố gắng
+
+    Nhận các dạng phổ biến:
+    - 'T', 'HTT', 'Hoàn thành tốt', 'Tốt'
+    - 'H', 'HT', 'Hoàn thành', 'Đạt'
+    - 'C', 'CCG', 'Cần cố gắng', 'Chưa đạt', 'Chưa hoàn thành'
+    - Có thể nhập số: >=8 -> HTT; >=5 -> HT; <5 -> CCG
+    """
+    s = str(value).strip().lower()
+
+    if s in ["t", "htt", "hoàn thành tốt", "hoan thanh tot", "tốt", "tot"]:
+        return "Hoàn thành tốt"
+    if s in ["h", "ht", "hoàn thành", "hoan thanh", "đạt", "dat"]:
+        return "Hoàn thành"
+    if s in ["c", "ccg", "cần cố gắng", "can co gang", "chưa đạt", "chua dat", "chưa hoàn thành", "chua hoan thanh"]:
+        return "Cần cố gắng"
+
+    # điểm số (nếu có)
+    try:
+        score = float(s.replace(",", "."))
+        if score >= 8:
+            return "Hoàn thành tốt"
+        if score >= 5:
+            return "Hoàn thành"
+        return "Cần cố gắng"
+    except:
+        return "Hoàn thành"
+
+def extract_context_from_evidence(evidence_files):
+    """
+    Trích 'Minh chứng' từ docx (text), pdf/image (media) để đưa vào Gemini.
+    Trả về: (context_text, media_files)
+    """
+    context_text = ""
+    media_files = []
+
+    if not evidence_files:
+        return context_text, media_files
+
+    for file in evidence_files:
+        try:
+            name = getattr(file, "name", "").lower()
+
+            # DOCX -> lấy text
+            if name.endswith(".docx"):
+                doc = Document(file)
+                context_text += "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                context_text += "\n"
+
+            # PDF -> upload file cho Gemini
+            elif getattr(file, "type", "") == "application/pdf" or name.endswith(".pdf"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(file.getvalue())
+                    tmp.flush()
+                    media_files.append(genai.upload_file(tmp.name))
+                try:
+                    os.unlink(tmp.name)
+                except:
+                    pass
+
+            # Ảnh -> mở ảnh
+            else:
+                img = Image.open(file)
+                media_files.append(img)
+
+        except:
+            # bỏ qua file lỗi
+            pass
+
+    return context_text, media_files
+
+def parse_ai_bullets_by_section(content: str) -> dict:
+    """
+    AI trả về theo cấu trúc:
+    I. MỨC: HOÀN THÀNH TỐT
+    - ...
+    II. MỨC: HOÀN THÀNH
+    - ...
+    III. MỨC: CẦN CỐ GẮNG
+    - ...
+
+    Trả về:
+    {"Hoàn thành tốt":[...], "Hoàn thành":[...], "Cần cố gắng":[...]}
+    """
+    sections = {"Hoàn thành tốt": [], "Hoàn thành": [], "Cần cố gắng": []}
+    current = None
+
+    lines = str(content).splitlines()
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        up = line.upper()
+
+        if "MỨC" in up and "HOÀN THÀNH TỐT" in up:
+            current = "Hoàn thành tốt"
+            continue
+        if "MỨC" in up and ("CẦN CỐ GẮNG" in up or "CAN CO GANG" in up):
+            current = "Cần cố gắng"
+            continue
+        if "MỨC" in up and "HOÀN THÀNH" in up:
+            current = "Hoàn thành"
+            continue
+
+        is_bullet = (
+            line.startswith("-")
+            or line.startswith("*")
+            or re.match(r"^\d+[\.\)]\s+", line)
+        )
+        if current and is_bullet:
+            text = re.sub(r"^[-*]\s*", "", line)
+            text = re.sub(r"^\d+[\.\)]\s*", "", text)
+            text = text.replace("**", "").strip()
+            text = clean_comment_format(text)
+
+            # lọc câu quá ngắn + lọc từ cấm
+            if len(text) >= 35 and not contains_forbidden_words(text):
+                sections[current].append(text)
+
+    return sections
+
+def ensure_unique_pool(pool: list, needed: int, fallback: str) -> list:
+    """
+    Lọc trùng + đảm bảo đủ số lượng.
+    Nếu thiếu, bù bằng câu fallback để tránh lỗi.
+    """
+    seen = set()
+    uniq = []
+    for s in pool:
+        key = normalize_spaces(s).lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(s)
+
+    while len(uniq) < needed:
+        uniq.append(fallback)
+
+    random.shuffle(uniq)
+    return uniq
+
+# =========================================================
+# 4) GIAO DIỆN
+# =========================================================
+st.markdown("""
+<div class="header-box">
+  <h1>📝 TRỢ LÝ ĐÁNH GIÁ THƯỜNG XUYÊN HẰNG THÁNG (TT27)</h1>
+  <p>Nhập danh sách → tạo nhận xét cá nhân hóa theo mức độ → xuất Excel</p>
+  <p><b>Tác giả:</b> La Mạnh Hùng – Trường PTDTBT TH&THCS Nà Khương</p>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="note">
+  <div><b>Lưu ý:</b> Đánh giá thường xuyên tập trung mô tả biểu hiện, mức độ hoàn thành và định hướng rèn luyện; không chấm điểm, không so sánh.</div>
+  <div class="muted">Quy tắc mặc định: không dùng “em / con / bạn / học sinh / HS”.</div>
+</div>
+""", unsafe_allow_html=True)
+
+# =========================================================
+# 5) API KEY
+# =========================================================
+with st.sidebar:
+    st.header("🔐 Cấu hình AI")
+    default_key = st.secrets["GEMINI_API_KEY"] if "GEMINI_API_KEY" in st.secrets else ""
+    manual_key = st.text_input("🔑 Nhập Gemini API Key:", type="password")
+
+    if manual_key:
+        api_key = manual_key
+        st.info("Đang dùng key cá nhân")
+    elif default_key:
+        api_key = default_key
+        st.success("Đang dùng key hệ thống (secrets)")
+    else:
+        api_key = None
+        st.warning("Chưa có API key!")
+
+    st.markdown("---")
+    st.header("⚙️ Tùy chọn")
+    model_name = st.selectbox(
+        "Model Gemini:",
+        ["gemini-2.5-flash", "gemini-2.5-flash-lite-preview-09-2025", "gemini-2.0-flash"],
+        index=1
+    )
+    st.caption("Nếu chạy chậm, chọn flash-lite để nhanh hơn.")
+
+if api_key:
+    try:
+        genai.configure(api_key=api_key)
+    except Exception:
+        st.error("API key có vẻ không hợp lệ. Vui lòng kiểm tra lại.")
+
+# =========================================================
+# 6) INPUT
+# =========================================================
+st.info("Bước 1: Tải file danh sách học sinh và (nếu có) minh chứng.")
+c1, c2 = st.columns(2)
+with c1:
+    student_file = st.file_uploader("📂 Danh sách HS (.xlsx/.xls):", type=["xlsx", "xls"])
+with c2:
+    evidence_files = st.file_uploader(
+        "📎 Minh chứng (ảnh/docx/pdf) - tùy chọn:",
+        type=["pdf", "png", "jpg", "jpeg", "docx"],
+        accept_multiple_files=True
+    )
+
+# =========================================================
+# 7) XỬ LÝ FILE HS
+# =========================================================
+if student_file:
+    df = pd.read_excel(student_file)
+    st.write("▼ Xem nhanh 5 dòng đầu:")
+    st.dataframe(df.head(5), use_container_width=True)
+    st.markdown("---")
+
+    col_level = st.selectbox("📌 Chọn cột MỨC/ĐIỂM/ĐẠT:", df.columns)
+    col_new = st.text_input("📌 Tên cột nhận xét mới:", "Nhận xét ĐGTX (tháng)")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        mon_hoc = st.text_input("📚 Môn:", "Toán")
+    with c4:
+        thang = st.selectbox(
+            "🗓️ Tháng đánh giá:",
+            ["Tháng 1", "Tháng 2", "Tháng 3", "Tháng 4", "Tháng 5", "Tháng 6",
+             "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12"],
+            index=0
+        )
+
+    chu_de = st.text_input("📝 Nội dung/chủ đề/tuần (ghi rõ):", "Chủ đề/Bài học trong tháng")
+    tieu_chi = st.text_area(
+        "✅ Tiêu chí quan sát (tùy chọn - càng cụ thể càng tốt):",
+        value="Tham gia học tập; thực hiện nhiệm vụ; hợp tác; vận dụng kiến thức; tuân thủ quy định."
+    )
+
+    st.markdown("---")
+    st.subheader("Bước 2: Tạo nhận xét")
+    st.caption("Hệ thống sẽ đếm số lượng theo 3 mức: Hoàn thành tốt / Hoàn thành / Cần cố gắng.")
+
+    if st.button("🚀 TẠO NHẬN XÉT ĐÁNH GIÁ THƯỜNG XUYÊN (KHÔNG TRÙNG LẶP)"):
+        if not api_key:
+            st.error("Thiếu API key Gemini. Vui lòng nhập trong thanh bên.")
+            st.stop()
+
+        progress = st.progress(0, text="Đang phân loại học sinh theo mức...")
+
+        df["__Level__"] = df[col_level].apply(classify_monthly_level)
+        counts = df["__Level__"].value_counts()
+
+        count_T = int(counts.get("Hoàn thành tốt", 0))
+        count_H = int(counts.get("Hoàn thành", 0))
+        count_C = int(counts.get("Cần cố gắng", 0))
+
+        st.write(f"📊 Số lượng: **HTT={count_T}**, **HT={count_H}**, **CCG={count_C}**")
+
+        progress.progress(15, text="Đang xử lý minh chứng (nếu có)...")
+        context_text, media_files = extract_context_from_evidence(evidence_files)
+
+        req_T = int(count_T * 1.1) + 2
+        req_H = int(count_H * 1.1) + 2
+        req_C = int(count_C * 1.1) + 2
+
+        progress.progress(30, text="Đang gọi AI tạo nhận xét...")
+
+        model = genai.GenerativeModel(model_name)
+
+        prompt = f"""
+Bạn là giáo viên tiểu học. Viết nhận xét ĐÁNH GIÁ THƯỜNG XUYÊN HẰNG THÁNG theo tinh thần TT27.
+
+THÔNG TIN:
+- Tháng: {thang}
+- Môn: {mon_hoc}
+- Nội dung/chủ đề trong tháng: {chu_de}
+- Tiêu chí quan sát: {tieu_chi}
+- Minh chứng tóm tắt (nếu có): {context_text[:2000]}
+
+QUY TẮC BẮT BUỘC:
+1) KHÔNG dùng các từ: "em", "con", "bạn", "học sinh", "HS", "cháu", "bé".
+2) KHÔNG chấm điểm, KHÔNG ghi số điểm, KHÔNG xếp loại/so sánh.
+3) Văn phong sư phạm, nêu biểu hiện cụ thể, ngắn gọn: 120–180 ký tự/câu.
+4) Mỗi câu đủ ý, tránh chung chung; KHÔNG viết in hoa toàn bộ.
+5) Mỗi câu KHÁC NHAU (không trùng lặp).
+
+SỐ LƯỢNG (BẮT BUỘC ĐỦ):
+- {req_T} câu cho mức: HOÀN THÀNH TỐT
+- {req_H} câu cho mức: HOÀN THÀNH
+- {req_C} câu cho mức: CẦN CỐ GẮNG
+
+GỢI Ý NỘI DUNG THEO MỨC:
+A) HOÀN THÀNH TỐT: ghi nhận rõ kỹ năng/tiến bộ + thái độ học tập tích cực; KHÔNG dùng "nhưng/tuy nhiên".
+B) HOÀN THÀNH: nêu điểm làm được + "tuy nhiên/nhưng" + 1 điểm cần rèn trong tháng tới (cụ thể).
+C) CẦN CỐ GẮNG: ghi nhận sự tham gia/điểm mạnh nhỏ + "nhưng" + cần hỗ trợ/rèn gì (cụ thể, nhẹ nhàng).
+
+ĐỊNH DẠNG TRẢ VỀ (CHÍNH XÁC):
+I. MỨC: HOÀN THÀNH TỐT
+- ...
+II. MỨC: HOÀN THÀNH
+- ...
+III. MỨC: CẦN CỐ GẮNG
+- ...
+"""
+
+        inputs = [prompt] + media_files
+
+        try:
+            response = model.generate_content(inputs)
+            ai_text = response.text if hasattr(response, "text") else str(response)
+
+            progress.progress(60, text="Đang tách câu và phân phối cho từng học sinh...")
+
+            sections = parse_ai_bullets_by_section(ai_text)
+
+            pool_T = ensure_unique_pool(
+                sections.get("Hoàn thành tốt", []),
+                count_T,
+                fallback="Hoàn thành tốt nhiệm vụ trong tháng, chủ động thực hiện bài tập và thể hiện thái độ học tập tích cực."
+            )
+            pool_H = ensure_unique_pool(
+                sections.get("Hoàn thành", []),
+                count_H,
+                fallback="Hoàn thành nhiệm vụ học tập trong tháng, tuy nhiên cần rèn thêm tính cẩn thận và duy trì tập trung khi thực hiện bài."
+            )
+            pool_C = ensure_unique_pool(
+                sections.get("Cần cố gắng", []),
+                count_C,
+                fallback="Có tham gia hoạt động học tập, nhưng cần được hướng dẫn thêm để hoàn thành nhiệm vụ đúng yêu cầu và duy trì thói quen tự luyện tập."
+            )
+
+            def assign_comment(level: str) -> str:
+                if level == "Hoàn thành tốt":
+                    return pool_T.pop(0) if pool_T else "Hoàn thành tốt nhiệm vụ trong tháng."
+                if level == "Hoàn thành":
+                    return pool_H.pop(0) if pool_H else "Hoàn thành nhiệm vụ trong tháng, cần rèn thêm một số nội dung."
+                if level == "Cần cố gắng":
+                    return pool_C.pop(0) if pool_C else "Cần cố gắng hơn trong tháng tới, cần hỗ trợ để hoàn thành nhiệm vụ."
+                return "Hoàn thành nhiệm vụ trong tháng."
+
+            df[col_new] = df["__Level__"].apply(assign_comment)
+            df.drop(columns=["__Level__"], inplace=True)
+
+            progress.progress(85, text="Đang xuất Excel kết quả...")
+
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Danh sách")
+                ws = writer.sheets["Danh sách"]
+                try:
+                    from openpyxl.utils import get_column_letter
+                    col_idx = df.columns.get_loc(col_new) + 1
+                    ws.column_dimensions[get_column_letter(col_idx)].width = 65
+                except:
+                    pass
+
+            output.seek(0)
+
+            progress.progress(100, text="Hoàn tất!")
+
+            st.success("✅ Đã tạo nhận xét đánh giá thường xuyên hằng tháng (mỗi học sinh 1 câu).")
+            st.download_button(
+                "⬇️ Tải file Excel kết quả",
+                data=output,
+                file_name=f"NhanXet_DGTX_{thang.replace(' ', '')}_{mon_hoc}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            with st.expander("🔎 Kiểm tra ngẫu nhiên 8 học sinh"):
+                cols_show = [c for c in [col_level, col_new] if c in df.columns]
+                st.dataframe(df.sample(min(8, len(df)))[cols_show], use_container_width=True)
+
+            with st.expander("🧾 Xem nội dung AI đã trả về (để kiểm tra)"):
+                st.text(ai_text[:8000])
+
+        except Exception as e:
+            st.error(f"Lỗi xử lý: {e}")
+
+# =========================================================
+# 8) FOOTER
+# =========================================================
+st.markdown("""
+<hr>
+<div style="text-align:center; color:#6b7280; font-size:14px;">
+© 2026 – La Mạnh Hùng – Trường PTDTBT TH&THCS Nà Khương<br>
+Trợ lý đánh giá thường xuyên hằng tháng học sinh tiểu học theo TT27
+</div>
+""", unsafe_allow_html=True)
