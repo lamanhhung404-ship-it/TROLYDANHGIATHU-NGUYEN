@@ -105,7 +105,7 @@ def process_ai_response_unique(content, target_level, needed_count):
 # --- 4. GIAO DIỆN CHÍNH ---
 st.markdown("""
 <div class="header-box">
-    <h1>💎 TRỢ LÝ NHẬN XÉT TIỂU HỌC TT27</h1>
+    <h1>💎 TRỢ LÝ NHẬN XÉT HÀNG THÁNG TIỂU HỌC TT27</h1>
     <p>Tác giả: La Mạnh Hùng - Trường PTDTBT TH&THCS Nà Khương</p>
 </div>
 """, unsafe_allow_html=True)
